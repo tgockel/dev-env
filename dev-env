@@ -1,0 +1,271 @@
+#!/bin/bash -e
+# Run a program in a development environment.
+
+PROJECT_ROOT=$(readlink -f $(dirname $0)/..)
+PROJECT_NAME=$(basename "${PROJECT_ROOT}")
+DOCKER_ROOT=$(readlink -f $(dirname $0)/docker)
+
+DEVENV_BASED_ON=v0.1.0
+DEVENV_UPGRADE_IMAGE=tgockel/dev-env-upgrade
+
+########################################################################################################################
+# Functions                                                                                                            #
+########################################################################################################################
+
+function fatal_error {
+  >&2 echo "$@"
+  exit 1
+}
+
+function run {
+  PROG=$1
+  hash "${PROG}" 2>/dev/null || fatal_error "Required program not installed: ${PROG}"
+
+  shift
+  "${PROG}" "$@"
+}
+
+# Get the default distribution file. If there is a dev-env-settings.json and the path '.default_distro' exists, then
+# that value will be used. If it does not exist, then the distro which is lexicographically largest will be used.
+function default_distro {
+  # If there is a settings file, use jq
+  CONFIG_JSON_FILE=$(readlink -f $(dirname $0)/dev-env-settings.json)
+  if [[ -e "${CONFIG_JSON_FILE}" ]]; then
+    JSON_DEFAULT=$(run jq -r '.default_distro' "${CONFIG_JSON_FILE}")
+    if [[ "${JSON_DEFAULT}" != "null" ]]; then
+      echo "${JSON_DEFAULT}"
+      return
+    fi
+  fi
+
+  # Guess that the distro people want is the lexicographically-largest
+  echo $(for dfile in $(ls ${DOCKER_ROOT}/*/Dockerfile); do basename $(dirname "$dfile"); done | sort -r | head -1)
+}
+
+########################################################################################################################
+# Program Options                                                                                                      #
+########################################################################################################################
+
+COMMAND=(bash -l)
+OPT_BUILD=1
+OPT_DISTRO=$(default_distro)
+OPT_IMAGE=
+OPT_FOLDER=$(basename ${PROJECT_ROOT})
+OPT_RM=1
+OPT_RUN=1
+OPT_TTY=1
+OPTS_VALID=1
+
+[[ "${EUID}" -eq 0 ]] && OPT_MAP_USER=0 || OPT_MAP_USER=1
+
+function show_usage {
+  echo "$0: Run a program in a Docker environment."
+  echo ""
+  echo "Common options:"
+  echo ""
+  echo "  --distro DISTRO"
+  echo "        The Linux distro to use (default: $(default_distro))"
+  echo ""
+  echo "        Available options:"
+  printf "         "
+  printf " %s" $(ls $(dirname $0)/docker)
+  echo ""
+  echo "  --keep"
+  echo "  --no-keep"
+  echo "        By default, the container is automatically deleted when the script"
+  echo "        exits. Specify --keep to prevent this."
+  echo ""
+  echo "  --tty"
+  echo "  --no-tty"
+  echo "        By default, a pseudo-TTY is created for interacting with the container."
+  echo "        Use --no-tty to disable this when you wish to pipe from stdout of the"
+  echo "        container to stdin of some other program."
+  echo ""
+  echo "  --"
+  echo "        Stop processing arguments and pass the remaining arguments to the"
+  echo "        container."
+  echo ""
+  echo "Uncommon options:"
+  echo ""
+  echo "  --build"
+  echo "  --no-build"
+  echo "        By default, 'docker build' is always run to build the container from"
+  echo "        sources. This is usually fast due to Docker build caching. Use"
+  echo "        --no-build to disable the attempt to build."
+  echo ""
+  echo "  --folder-name NAME"
+  echo "        The name of the folder to create inside the container."
+  echo ""
+  echo "  --image IMAGE"
+  echo "        The name of the Docker image to build or run. By default, this is"
+  echo "        \"${PROJECT_NAME}/\${DISTRO}/dev\"."
+  echo ""
+  echo "  --map-user"
+  echo "  --no-map-user"
+  echo "        If set, map the user and group IDs inside the container to the same"
+  echo "        values outside of the container. This allows saving files inside the"
+  echo "        container without having to muck with permssions. This is enabled by"
+  echo "        default if running as non-root user."
+  echo ""
+  echo "  --run"
+  echo "  --no-run"
+  echo "        If --no-run is specified, the container will be built only."
+}
+
+while [[ $# -gt 0 ]]; do
+  key="$1"
+
+  case $key in
+    --build)
+      OPT_BUILD=1
+      shift
+      ;;
+    --no-build)
+      OPT_BUILD=0
+      shift
+      ;;
+    --distro)
+      OPT_DISTRO="$2"
+      shift 2
+      ;;
+    --distro=*)
+      OPT_DISTRO="${key/--distro=/}"
+      shift
+      ;;
+    --folder-name)
+      OPT_FOLDER="$2"
+      shift 2
+      ;;
+    --folder-name=*)
+      OPT_FOLDER="${key/--folder-name=/}"
+      shift
+      ;;
+    --image)
+      OPT_IMAGE="$2"
+      shift 2
+      ;;
+    --image=*)
+      OPT_IMAGE="${key/--image=/}"
+      shift
+      ;;
+    --keep)
+      OPT_RM=0
+      shift
+      ;;
+    --no-keep)
+      OPT_RM=1
+      shift
+      ;;
+    --map-user)
+      OPT_MAP_USER=1
+      shift
+      ;;
+    --no-map-user)
+      OPT_MAP_USER=0
+      shift
+      ;;
+    --run)
+      OPT_RUN=1
+      shift
+      ;;
+    --no-run)
+      OPT_RUN=0
+      shift
+      ;;
+    --tty)
+      OPT_TTY=1
+      shift
+      ;;
+    --no-tty)
+      OPT_TTY=0
+      shift
+      ;;
+    --upgrade-dev-env)
+      OPT_BUILD=0
+      OPT_IMAGE="${DEVENV_UPGRADE_IMAGE}"
+      shift
+      ;;
+    --)
+      shift
+      COMMAND=("$@")
+      break
+      ;;
+    --help|-h)
+      show_usage
+      exit 1
+      ;;
+    *)
+      >&2 echo "Unrecognized option: \"${key}\""
+      OPTS_VALID=0
+      shift
+      ;;
+  esac
+done
+
+if [[ ${OPTS_VALID} -eq 0 ]]; then
+  >&2 show_usage
+  exit 1
+fi
+
+[[ ${OPT_RM} -eq 1 ]]  && CMD_RM='--rm'   || CMD_RM=''
+[[ ${OPT_TTY} -eq 1 ]] && CMD_TTY='--tty' || CMD_TTY=''
+
+########################################################################################################################
+# Image Building                                                                                                       #
+########################################################################################################################
+
+if [[ -z "${OPT_IMAGE}" ]]; then
+  IMAGE_NAME=${PROJECT_NAME}/${OPT_DISTRO}/dev
+else
+  IMAGE_NAME=${OPT_IMAGE}
+fi
+
+if [[ ${OPT_BUILD} -eq 1 ]]; then
+  DOCKER_DIR=${PROJECT_ROOT}/tools/docker/${OPT_DISTRO}
+
+  if ! [[ -e "${DOCKER_DIR}/Dockerfile" ]]; then
+    >&2 echo "No Dockerfile in \"${DOCKER_DIR}\""
+    exit 1
+  fi
+
+  docker build "${DOCKER_DIR}" -t ${IMAGE_NAME}
+fi
+
+########################################################################################################################
+# Running                                                                                                              #
+########################################################################################################################
+
+if [[ ${OPT_RUN} -eq 1 ]]; then
+  CONTAINER_ID=$(docker run                                 \
+                 ${CMD_RM}                                  \
+                 --detach                                   \
+                 --volume="${PROJECT_ROOT}:/${OPT_FOLDER}"  \
+                 --workdir "/${OPT_FOLDER}"                 \
+                 "${IMAGE_NAME}"                            \
+                 sleep infinity                             \
+                )
+  trap "docker stop -t 0 ${CONTAINER_ID} >/dev/null" EXIT
+
+  if [[ ${OPT_MAP_USER} -eq 1 ]]; then
+    GROUP_NAME=$(id -ng)
+    GROUP_ID=$(id -g)
+    docker exec ${CONTAINER_ID} groupadd --gid ${GROUP_ID} ${GROUP_NAME}
+
+    USER_NAME=$(id -nu)
+    USER_ID=$(id -u)
+    docker exec ${CONTAINER_ID} useradd -u ${USER_ID} -g ${GROUP_ID} ${USER_NAME}
+
+    # Allow sudo without password
+    docker exec ${CONTAINER_ID} bash -c "echo '${USER_NAME} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
+
+    # Bazel creates a ~/.cache file, so we have to make sure ~ exists and is owned by the proper user.
+    docker exec ${CONTAINER_ID} mkdir -p "/home/${USER_NAME}"
+    docker exec ${CONTAINER_ID} chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}"
+
+    CMD_USER="--user=$(id -u):$(id -g)"
+  else
+    CMD_USER=''
+  fi
+
+  docker exec -i ${CMD_TTY} ${CMD_USER} ${CONTAINER_ID} "${COMMAND[@]}"
+fi
