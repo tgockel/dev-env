@@ -5,8 +5,9 @@ PROJECT_ROOT=$(readlink -f $(dirname $0)/..)
 PROJECT_NAME=$(basename "${PROJECT_ROOT}")
 DOCKER_ROOT=$(readlink -f $(dirname $0)/docker)
 
+DEVENV_REPO=https://github.com/tgockel/dev-env.git
+DEVENV_REPO_RAW=https://raw.githubusercontent.com/tgockel/dev-env
 DEVENV_BASED_ON=v0.1.0
-DEVENV_UPGRADE_IMAGE=tgockel/dev-env-upgrade
 
 ########################################################################################################################
 # Functions                                                                                                            #
@@ -42,18 +43,71 @@ function default_distro {
   echo $(for dfile in $(ls ${DOCKER_ROOT}/*/Dockerfile); do basename $(dirname "$dfile"); done | sort -r | head -1)
 }
 
+# Get the latest version tag of the dev-env script.
+function upgrade_dev_env_get_latest_version_tag {
+  BEST_VERSION=$(run git ls-remote --exit-code --tags --refs "${DEVENV_REPO}" \
+                | cut --delimiter=/ --fields=3                                \
+                | sort -V                                                     \
+                | tail -1                                                     \
+                )
+  if [[ -z "${BEST_VERSION}" ]]; then
+    fatal_error "Error getting latest version -- could not get any tags from ${DEVENV_REPO}"
+  fi
+
+  echo "${BEST_VERSION}"
+}
+
+# Fetch a specific version of the dev-env script.
+#
+# Args:
+#  $1: The version to fetch
+function upgrade_dev_env_fetch_script {
+  if [[ $# -ne 1 ]]; then
+    fatal_error "upgrade_dev_env_fetch_script must be called with exactly 1 argument"
+  fi
+
+  VERSION_TAG=$1
+  FETCH_URL="${DEVENV_REPO_RAW}/${VERSION_TAG}/dev-env"
+
+  run curl --fail "${FETCH_URL}" || fatal_error "Failed to fetch ${FETCH_URL}"
+}
+
+# Run the 3-way merge tool.
+#
+# Args:
+#  $1: The base version this file was based on (the DEVENV_BASED_ON version)
+#  $2: The path of the file to upgrade (this file)
+#  $3: The newest version to update to (from upgrade_dev_env_fetch_script)
+#  $4: Temporary output path
+function upgrade_dev_env_merge {
+  if [[ $# -ne 4 ]]; then
+    fatal_error "upgrade_dev_env_merge must be called with exactly 3 arguments -- {base} {file} {upstream} {output}"
+  fi
+
+  BASE="$1"
+  CURRENT="$2"
+  UPSTREAM="$3"
+  OUTPUT="$4"
+
+  MERGE_TOOL=$(run git config merge.tool)
+  run ${MERGE_TOOL} --merge --auto "${BASE}" "${CURRENT}" "${UPSTREAM}" -o "${OUTPUT}"
+  mv "${OUTPUT}" "${CURRENT}"
+}
+
 ########################################################################################################################
 # Program Options                                                                                                      #
 ########################################################################################################################
 
 COMMAND=(bash -l)
 OPT_BUILD=1
-OPT_DISTRO=$(default_distro)
+OPT_DISTRO=
 OPT_IMAGE=
 OPT_FOLDER=$(basename ${PROJECT_ROOT})
 OPT_RM=1
 OPT_RUN=1
 OPT_TTY=1
+OPT_UPGRADE_DEVENV=0
+OPT_UPGRADE_DEVENV_VERSION_TAG=
 OPTS_VALID=1
 
 [[ "${EUID}" -eq 0 ]] && OPT_MAP_USER=0 || OPT_MAP_USER=1
@@ -110,6 +164,10 @@ function show_usage {
   echo "  --run"
   echo "  --no-run"
   echo "        If --no-run is specified, the container will be built only."
+  echo ""
+  echo "  --upgrade-dev-env"
+  echo "  --upgrade-dev-env-to VERSION"
+  echo "        Upgrade this script to the latest or a specific {VERSION}."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -181,8 +239,17 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --upgrade-dev-env)
-      OPT_BUILD=0
-      OPT_IMAGE="${DEVENV_UPGRADE_IMAGE}"
+      OPT_UPGRADE_DEVENV=1
+      shift
+      ;;
+    --upgrade-dev-env-to)
+      OPT_UPGRADE_DEVENV=1
+      OPT_UPGRADE_DEVENV_VERSION_TAG="$2"
+      shift 2
+      ;;
+    --upgrade-dev-env-to=*)
+      OPT_UPGRADE_DEVENV=1
+      OPT_UPGRADE_DEVENV_VERSION_TAG="${key/--upgrade-dev-env-to=/}"
       shift
       ;;
     --)
@@ -211,8 +278,38 @@ fi
 [[ ${OPT_TTY} -eq 1 ]] && CMD_TTY='--tty' || CMD_TTY=''
 
 ########################################################################################################################
+# Upgrading dev-env                                                                                                    #
+########################################################################################################################
+
+if [[ ${OPT_UPGRADE_DEVENV} -eq 1 ]]; then
+  if [[ -z "${OPT_UPGRADE_DEVENV_VERSION_TAG}" ]]; then
+    VERSION_TAG=$(upgrade_dev_env_get_latest_version_tag)
+  else
+    VERSION_TAG="${OPT_UPGRADE_DEVENV_VERSION_TAG}"
+  fi
+
+  if [[ "${VERSION_TAG}" == "${DEVENV_BASED_ON}" ]]; then
+    >&2 echo "Latest version is ${VERSION_TAG} -- not upgrading, as the version tag is the same"
+    exit 0
+  else
+    >&2 echo "Upgrading from ${DEVENV_BASED_ON} to ${VERSION_TAG}"
+  fi
+
+  WORKING_DIR=$(mktemp -d)
+  upgrade_dev_env_fetch_script "${DEVENV_BASED_ON}" > "${WORKING_DIR}/dev-env-base"
+  upgrade_dev_env_fetch_script "${VERSION_TAG}"     > "${WORKING_DIR}/dev-env-upstream"
+
+  upgrade_dev_env_merge "${WORKING_DIR}/dev-env-base" "$0" "${WORKING_DIR}/dev-env-upstream" "${WORKING_DIR}/dev-env-temp"
+  exit 0
+fi
+
+########################################################################################################################
 # Image Building                                                                                                       #
 ########################################################################################################################
+
+if [[ -z "${OPT_DISTRO}" ]]; then
+  OPT_DISTRO=$(default_distro)
+fi
 
 if [[ -z "${OPT_IMAGE}" ]]; then
   IMAGE_NAME=${PROJECT_NAME}/${OPT_DISTRO}/dev
@@ -221,7 +318,7 @@ else
 fi
 
 if [[ ${OPT_BUILD} -eq 1 ]]; then
-  DOCKER_DIR=${PROJECT_ROOT}/tools/docker/${OPT_DISTRO}
+  DOCKER_DIR=${DOCKER_ROOT}/${OPT_DISTRO}
 
   if ! [[ -e "${DOCKER_DIR}/Dockerfile" ]]; then
     >&2 echo "No Dockerfile in \"${DOCKER_DIR}\""
@@ -258,7 +355,7 @@ if [[ ${OPT_RUN} -eq 1 ]]; then
     # Allow sudo without password
     docker exec ${CONTAINER_ID} bash -c "echo '${USER_NAME} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
 
-    # Bazel creates a ~/.cache file, so we have to make sure ~ exists and is owned by the proper user.
+    # It is fairly common for tools to rely on ~, so make sure ~ exists and is owned by the proper user
     docker exec ${CONTAINER_ID} mkdir -p "/home/${USER_NAME}"
     docker exec ${CONTAINER_ID} chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}"
 
