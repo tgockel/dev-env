@@ -344,22 +344,38 @@ if [[ ${OPT_RUN} -eq 1 ]]; then
   trap "docker stop -t 0 ${CONTAINER_ID} >/dev/null" EXIT
 
   if [[ ${OPT_MAP_USER} -eq 1 ]]; then
-    GROUP_NAME=$(id -ng)
     GROUP_ID=$(id -g)
-    docker exec ${CONTAINER_ID} groupadd --gid ${GROUP_ID} ${GROUP_NAME}
+    GROUP_NAME=$(id -ng)
+    GROUP_NAME_INSIDE=$(docker exec ${CONTAINER_ID} getent group ${GROUP_ID} | cut -d':' -f1 || true)
+    if [[ -z "${GROUP_NAME_INSIDE}" ]]; then
+      # The container does not have a group with the current user's GID -- create one
+      GROUP_NAME_INSIDE="${GROUP_NAME}"
+      until docker exec ${CONTAINER_ID} groupadd --gid ${GROUP_ID} "${GROUP_NAME_INSIDE}"; do
+        # If creating the group failed, keep adding underscores to the name until it succeeds
+        GROUP_NAME_INSIDE="${GROUP_NAME_INSIDE}_"
+      done
+    fi
 
-    USER_NAME=$(id -nu)
     USER_ID=$(id -u)
-    docker exec ${CONTAINER_ID} useradd -u ${USER_ID} -g ${GROUP_ID} ${USER_NAME}
+    USER_NAME=$(id -nu)
+    USER_NAME_INSIDE=$(docker exec ${CONTAINER_ID} getent passwd ${USER_ID} | cut -d':' -f1 || true)
+    if [[ -z "${USER_NAME_INSIDE}" ]]; then
+      # The container does not have a user name with the current user's UID -- create one
+      USER_NAME_INSIDE="${USER_NAME}"
+      until docker exec ${CONTAINER_ID} useradd -u ${USER_ID} -g ${GROUP_ID} "${USER_NAME_INSIDE}"; do
+        # If creating the user failed, keep adding underscores to the name until it succeeds
+        USER_NAME_INSIDE="${USER_NAME_INSIDE}_"
+      done
+    fi
 
     # Allow sudo without password
-    docker exec ${CONTAINER_ID} bash -c "echo '${USER_NAME} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
+    docker exec ${CONTAINER_ID} bash -c "echo '${USER_NAME_INSIDE} ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers"
 
     # It is fairly common for tools to rely on ~, so make sure ~ exists and is owned by the proper user
-    docker exec ${CONTAINER_ID} mkdir -p "/home/${USER_NAME}"
-    docker exec ${CONTAINER_ID} chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}"
+    docker exec ${CONTAINER_ID} mkdir -p "/home/${USER_NAME_INSIDE}"
+    docker exec ${CONTAINER_ID} chown "${USER_NAME_INSIDE}:${GROUP_NAME_INSIDE}" "/home/${USER_NAME_INSIDE}"
 
-    CMD_USER="--user=$(id -u):$(id -g)"
+    CMD_USER="--user=${USER_ID}:${GROUP_ID}"
   else
     CMD_USER=''
   fi
