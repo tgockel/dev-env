@@ -81,7 +81,7 @@ function upgrade_dev_env_fetch_script {
 #  $4: Temporary output path
 function upgrade_dev_env_merge {
   if [[ $# -ne 4 ]]; then
-    fatal_error "upgrade_dev_env_merge must be called with exactly 3 arguments -- {base} {file} {upstream} {output}"
+    fatal_error "upgrade_dev_env_merge must be called with exactly 4 arguments -- {base} {file} {upstream} {output}"
   fi
 
   BASE="$1"
@@ -89,8 +89,14 @@ function upgrade_dev_env_merge {
   UPSTREAM="$3"
   OUTPUT="$4"
 
-  MERGE_TOOL=$(run git config merge.tool)
-  run ${MERGE_TOOL} --merge --auto "${BASE}" "${CURRENT}" "${UPSTREAM}" -o "${OUTPUT}"
+  MERGE_TOOL=$(run git config merge.tool || echo diff3)
+  if [[ "${MERGE_TOOL}" == "kdiff3" ]]; then
+    run ${MERGE_TOOL} --merge --auto "${BASE}" "${CURRENT}" "${UPSTREAM}" -o "${OUTPUT}"
+  else
+    # Assume diff3-like use
+    run ${MERGE_TOOL} --merge "${CURRENT}" "${BASE}" "${UPSTREAM}" > "${OUTPUT}"
+  fi
+
   mv "${OUTPUT}" "${CURRENT}"
 }
 
